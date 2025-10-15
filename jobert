@@ -1,451 +1,556 @@
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-#include <Keypad.h>
-#include <SPI.h>
-#include <MFRC522.h>
-#include <ArduinoJson.h>
+from flask import Flask, request, jsonify
+from flask_graphql import GraphQLView
+import graphene
+from datetime import datetime
+import json
 
+app = Flask(__name__)
 
-// ============ WiFi Credentials ============
-const char* ssid = "YOUR_SSID";
-const char* password = "YOUR_PASSWORD";
-const char* serverIP = "192.168.1.100";
-const int serverPort = 5000;
+# Mock database structure with accounts, PINs, and cards
+accounts_db = [
+    {
+        "accountId": "ACC001",
+        "accountHolder": "John Doe",
+        "balance": 5000.50,
+        "cardUID": "1234ABCD",
+        "pin": "1234",
+        "pinAttempts": 0,
+        "locked": False
+    },
+    {
+        "accountId": "ACC002",
+        "accountHolder": "Jane Smith",
+        "balance": 12500.75,
+        "cardUID": "5678EFGH",
+        "pin": "5678",
+        "pinAttempts": 0,
+        "locked": False
+    }
+]
 
-// ============ LCD Setup (20x4, I2C address 0x27) ============
-LiquidCrystal_I2C lcd(0x27, 20, 4);
+transactions_db = [
+    {"accountId": "ACC001", "transactionId": "TXN001", "description": "Salary Deposit", "amount": 5000.0, "type": "credit", "timestamp": 1696900800},
+    {"accountId": "ACC001", "transactionId": "TXN002", "description": "ATM Withdrawal", "amount": 150.50, "type": "debit", "timestamp": 1696814400},
+    {"accountId": "ACC001", "transactionId": "TXN003", "description": "Utility Bill", "amount": 200.0, "type": "debit", "timestamp": 1696728000},
+    {"accountId": "ACC002", "transactionId": "TXN004", "description": "Salary Deposit", "amount": 12500.0, "type": "credit", "timestamp": 1696900800},
+]
 
-// ============ RFID Setup ============
-#define SCK_PIN 18
-#define MOSI_PIN 23
-#define MISO_PIN 19
-#define SS_PIN 5
-MFRC522 mfrc522(SS_PIN, -1);
+login_history_db = []
 
-// ============ Keypad Setup ============
-const byte ROWS = 4;
-const byte COLS = 4;
-char keys[ROWS][COLS] = {
-    {'1', '2', '3', 'A'},
-    {'4', '5', '6', 'B'},
-    {'7', '8', '9', 'C'},
-    {'*', '0', '#', 'D'}
-};
+def get_current_timestamp():
+    return int(datetime.now().timestamp())
 
-byte rowPins[ROWS] = {32, 33, 25, 26};
-byte colPins[COLS] = {27, 14, 12, 13};
-Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+def format_timestamp(timestamp):
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
-// ============ Account Variables ============
-String currentAccount = "";
-String rfidUID = "";
-float currentBalance = 0.0;
-String accountHolder = "";
-bool cardScanned = false;
+# GraphQL Types
+class AccountType(graphene.ObjectType):
+    account_id = graphene.String()
+    account_holder = graphene.String()
+    balance = graphene.Float()
+    card_uid = graphene.String()
+    locked = graphene.Boolean()
 
-// ============ Function Prototypes ============
-void connectToWiFi();
-void initializeRFID();
-void initializeLCD();
-void scanRFID();
-void showMainMenu();
-void checkBalance();
-void performWithdrawal();
-void viewHistory();
-void displayMessage(String line1, String line2, String line3 = "", String line4 = "", int delayTime = 2000);
-String makeAPICall(String endpoint);
-String inputAmount();
-void updateBalance();
-void addTransaction(String description, float amount, String type);
+class TransactionType(graphene.ObjectType):
+    transaction_id = graphene.String()
+    account_id = graphene.String()
+    description = graphene.String()
+    amount = graphene.Float()
+    type = graphene.String()
+    timestamp = graphene.Int()
+    formatted_time = graphene.String()
 
-// ============ SETUP ============
-void setup() {
-    Serial.begin(115200);
-delay(1000);
+class LoginHistoryType(graphene.ObjectType):
+    account_id = graphene.String()
+    account_holder = graphene.String()
+    login_time = graphene.String()
+    timestamp = graphene.Int()
 
-// Initialize components
-initializeLCD();
-displayMessage("Initializing...", "", "", "", 1000);
+class AuthenticationResponse(graphene.ObjectType):
+    success = graphene.Boolean()
+    message = graphene.String()
+    account = graphene.Field(AccountType)
+    timestamp = graphene.Int()
+    formatted_time = graphene.String()
 
-connectToWiFi();
-initializeRFID();
+class WithdrawalResponse(graphene.ObjectType):
+    success = graphene.Boolean()
+    message = graphene.String()
+    account_id = graphene.String()
+    withdraw_amount = graphene.Float()
+    new_balance = graphene.Float()
+    timestamp = graphene.Int()
+    formatted_time = graphene.String()
 
-displayMessage("System Ready!", "Scan RFID Card", "", "", 2000);
-showMainMenu();
+class TransactionHistory(graphene.ObjectType):
+    account_id = graphene.String()
+    transactions = graphene.List(TransactionType)
+    count = graphene.Int()
+
+class TimestampResponse(graphene.ObjectType):
+    timestamp = graphene.Int()
+    formatted_time = graphene.String()
+
+# GraphQL Queries
+class Query(graphene.ObjectType):
+    # Authenticate with card UID and PIN
+    authenticate = graphene.Field(
+        AuthenticationResponse,
+        card_uid=graphene.String(required=True),
+        pin=graphene.String(required=True)
+    )
+
+    # Get balance
+    balance = graphene.Field(
+        AccountType,
+        account_id=graphene.String(required=True)
+    )
+
+    # Get transaction history
+    transactions = graphene.Field(
+        TransactionHistory,
+        account_id=graphene.String(required=True)
+    )
+
+    # Get login history
+    login_history = graphene.List(
+        LoginHistoryType,
+        account_id=graphene.String(required=True)
+    )
+
+    # Get current timestamp
+    timestamp = graphene.Field(TimestampResponse)
+
+    def resolve_authenticate(self, info, card_uid, pin):
+        card_uid = card_uid.upper()
+
+        # Find account by card UID
+        account = None
+        for acc in accounts_db:
+            if acc['cardUID'] == card_uid:
+                account = acc
+                break
+
+        if not account:
+            return AuthenticationResponse(
+                success=False,
+                message="Card not recognized",
+                account=None,
+                timestamp=get_current_timestamp(),
+                formatted_time=format_timestamp(get_current_timestamp())
+            )
+
+        # Check if account is locked
+        if account['locked']:
+            return AuthenticationResponse(
+                success=False,
+                message="Account locked. Too many failed attempts.",
+                account=None,
+                timestamp=get_current_timestamp(),
+                formatted_time=format_timestamp(get_current_timestamp())
+            )
+
+        # Verify PIN
+        if account['pin'] != pin:
+            account['pinAttempts'] += 1
+            if account['pinAttempts'] >= 3:
+                account['locked'] = True
+                return AuthenticationResponse(
+                    success=False,
+                    message="Account locked. Too many failed attempts.",
+                    account=None,
+                    timestamp=get_current_timestamp(),
+                    formatted_time=format_timestamp(get_current_timestamp())
+                )
+            return AuthenticationResponse(
+                success=False,
+                message=f"Incorrect PIN. {3 - account['pinAttempts']} attempts remaining.",
+                account=None,
+                timestamp=get_current_timestamp(),
+                formatted_time=format_timestamp(get_current_timestamp())
+            )
+
+        # Reset PIN attempts on successful login
+        account['pinAttempts'] = 0
+
+        # Log the login
+        login_record = {
+            "accountId": account['accountId'],
+            "accountHolder": account['accountHolder'],
+            "loginTime": format_timestamp(get_current_timestamp()),
+            "timestamp": get_current_timestamp()
+        }
+        login_history_db.append(login_record)
+
+        return AuthenticationResponse(
+            success=True,
+            message="Authentication successful",
+            account=AccountType(
+                account_id=account['accountId'],
+                account_holder=account['accountHolder'],
+                balance=account['balance'],
+                card_uid=account['cardUID'],
+                locked=account['locked']
+            ),
+            timestamp=get_current_timestamp(),
+            formatted_time=format_timestamp(get_current_timestamp())
+        )
+
+    def resolve_balance(self, info, account_id):
+        for account in accounts_db:
+            if account['accountId'] == account_id:
+                return AccountType(
+                    account_id=account['accountId'],
+                    account_holder=account['accountHolder'],
+                    balance=account['balance'],
+                    card_uid=account['cardUID'],
+                    locked=account['locked']
+                )
+        return None
+
+    def resolve_transactions(self, info, account_id):
+        account_transactions = [txn for txn in transactions_db if txn['accountId'] == account_id]
+
+        formatted_txns = []
+        for txn in account_transactions:
+            formatted_txns.append(TransactionType(
+                transaction_id=txn['transactionId'],
+                account_id=txn['accountId'],
+                description=txn['description'],
+                amount=txn['amount'],
+                type=txn['type'],
+                timestamp=txn['timestamp'],
+                formatted_time=format_timestamp(txn['timestamp'])
+            ))
+
+        return TransactionHistory(
+            account_id=account_id,
+            transactions=formatted_txns,
+            count=len(formatted_txns)
+        )
+
+    def resolve_login_history(self, info, account_id):
+        account_logins = [login for login in login_history_db if login['accountId'] == account_id]
+        return [LoginHistoryType(**login) for login in account_logins]
+
+    def resolve_timestamp(self, info):
+        ts = get_current_timestamp()
+        return TimestampResponse(
+            timestamp=ts,
+            formatted_time=format_timestamp(ts)
+        )
+
+# GraphQL Mutations
+class WithdrawMoney(graphene.Mutation):
+    class Arguments:
+        account_id = graphene.String(required=True)
+        amount = graphene.Float(required=True)
+
+    Output = WithdrawalResponse
+
+    def mutate(self, info, account_id, amount):
+        # Find account
+        account = None
+        for acc in accounts_db:
+            if acc['accountId'] == account_id:
+                account = acc
+                break
+
+        if not account:
+            return WithdrawalResponse(
+                success=False,
+                message="Account not found",
+                account_id=account_id,
+                withdraw_amount=0,
+                new_balance=0,
+                timestamp=get_current_timestamp(),
+                formatted_time=format_timestamp(get_current_timestamp())
+            )
+
+        if amount > account['balance']:
+            return WithdrawalResponse(
+                success=False,
+                message="Insufficient balance",
+                account_id=account_id,
+                withdraw_amount=amount,
+                new_balance=account['balance'],
+                timestamp=get_current_timestamp(),
+                formatted_time=format_timestamp(get_current_timestamp())
+            )
+
+        # Process withdrawal
+        account['balance'] -= amount
+
+        # Add transaction
+        transaction = {
+            "accountId": account_id,
+            "transactionId": f"TXN{len(transactions_db) + 1:03d}",
+            "description": "ATM Withdrawal",
+            "amount": amount,
+            "type": "debit",
+            "timestamp": get_current_timestamp()
+        }
+        transactions_db.append(transaction)
+
+        return WithdrawalResponse(
+            success=True,
+            message="Withdrawal successful",
+            account_id=account_id,
+            withdraw_amount=amount,
+            new_balance=account['balance'],
+            timestamp=get_current_timestamp(),
+            formatted_time=format_timestamp(get_current_timestamp())
+        )
+
+class Mutation(graphene.ObjectType):
+    withdraw_money = WithdrawMoney.Field()
+
+schema = graphene.Schema(query=Query, mutation=Mutation)
+
+# Add GraphQL endpoint
+app.add_url_rule(
+    '/graphql',
+    view_func=GraphQLView.as_view('graphql', schema=schema, graphiql=True)
+)
+
+@app.route('/')
+def home():
+    """Root endpoint with API documentation"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>GraphQL Banking API</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        * {
+          margin: 0;
+          padding: 0;
+          box-sizing: border-box;
+        }
+        
+        body {
+          font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          min-height: 100vh;
+          padding: 20px;
+        }
+        
+        .container {
+          max-width: 1200px;
+          margin: 0 auto;
+        }
+        
+        .header {
+          text-align: center;
+          color: white;
+          margin-bottom: 40px;
+        }
+        
+        .header h1 {
+          font-size: 3em;
+          margin-bottom: 10px;
+          text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        
+        .header p {
+          font-size: 1.2em;
+          opacity: 0.95;
+        }
+        
+        .info-box {
+          background: white;
+          border-radius: 15px;
+          padding: 30px;
+          box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+          margin-bottom: 30px;
+        }
+        
+        .info-box h2 {
+          color: #333;
+          margin-bottom: 20px;
+        }
+        
+        .endpoint {
+          background: #f9f9f9;
+          padding: 15px;
+          margin: 10px 0;
+          border-left: 4px solid #667eea;
+          border-radius: 5px;
+        }
+        
+        .endpoint h3 {
+          color: #667eea;
+          margin-bottom: 10px;
+        }
+        
+        pre {
+          background: #2d2d2d;
+          color: #f8f8f2;
+          padding: 15px;
+          border-radius: 8px;
+          overflow-x: auto;
+          font-size: 0.9em;
+        }
+        
+        .btn {
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          color: white;
+          border: none;
+          padding: 12px 24px;
+          border-radius: 8px;
+          cursor: pointer;
+          font-size: 1em;
+          text-decoration: none;
+          display: inline-block;
+          margin: 10px 5px;
+        }
+        
+        .btn:hover {
+          transform: scale(1.05);
+          box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .accounts-list {
+          background: #f9f9f9;
+          border-radius: 10px;
+          padding: 15px;
+          margin-top: 15px;
+        }
+        
+        .account-item {
+          background: white;
+          padding: 12px;
+          margin-bottom: 10px;
+          border-radius: 8px;
+          border-left: 4px solid #764ba2;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>🔐 GraphQL Banking API</h1>
+          <p>ESP32 RFID Banking System with PIN Authentication</p>
+        </div>
+        
+        <div class="info-box">
+          <h2>🚀 Quick Start</h2>
+          <p>Access the interactive GraphQL playground to test queries and mutations:</p>
+          <a href="/graphql" class="btn">Open GraphQL Playground →</a>
+        </div>
+        
+        <div class="info-box">
+          <h2>📋 Authentication Query (ESP32 Usage)</h2>
+          <div class="endpoint">
+            <h3>Authenticate with Card UID and PIN</h3>
+            <p>When user scans card and enters PIN (1234), press # to call this:</p>
+            <pre>
+query {
+  authenticate(cardUid: "1234ABCD", pin: "1234") {
+    success
+    message
+    account {
+      accountId
+      accountHolder
+      balance
+    }
+    formattedTime
+  }
 }
-
-// ============ MAIN LOOP ============
-void loop() {
-            // Check for RFID card
-scanRFID();
-
-// Check for keypad input only if card is scanned
-if (cardScanned) {
-char key = keypad.getKey();
-
-if (key) {
-Serial.println("Key Pressed: " + String(key));
-
-if (key == '1') {
-checkBalance();
+            </pre>
+          </div>
+          
+          <div class="endpoint">
+            <h3>Get Balance</h3>
+            <pre>
+query {
+  balance(accountId: "ACC001") {
+    accountId
+    accountHolder
+    balance
+  }
 }
-else if (key == '2') {
-performWithdrawal();
+            </pre>
+          </div>
+          
+          <div class="endpoint">
+            <h3>Get Transaction History</h3>
+            <pre>
+query {
+  transactions(accountId: "ACC001") {
+    accountId
+    count
+    transactions {
+      transactionId
+      description
+      amount
+      type
+      formattedTime
+    }
+  }
 }
-else if (key == '3') {
-viewHistory();
+            </pre>
+          </div>
+          
+          <div class="endpoint">
+            <h3>Process Withdrawal</h3>
+            <pre>
+mutation {
+  withdrawMoney(accountId: "ACC001", amount: 100.00) {
+    success
+    message
+    withdrawAmount
+    newBalance
+    formattedTime
+  }
 }
-}
-}
-
-delay(100);
-}
-
-// ============ RFID SCANNING ============
-void scanRFID() {
-if (!mfrc522.PICC_IsNewCardPresent()) {
-return;
-}
-
-if (!mfrc522.PICC_ReadCardSerial()) {
-return;
-}
-
-// Get the card's UID
-rfidUID = "";
-for (byte i = 0; i < mfrc522.uid.size; i++) {
-rfidUID += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
-rfidUID += String(mfrc522.uid.uidByte[i], HEX);
-}
-rfidUID.toUpperCase();
-
-Serial.println("Card UID: " + rfidUID);
-
-// Map RFID UID to Account ID (you can modify this mapping)
-if (rfidUID == "1A2B3C4D") {
-currentAccount = "ACC001";
-}
-else if (rfidUID == "5E6F7G8H") {
-currentAccount = "ACC002";
-}
-else {
-displayMessage("Card not", "recognized!", "", "", 2000);
-mfrc522.PICC_HaltA();
-mfrc522.PCD_StopCrypto1();
-return;
-}
-
-// Update balance and show menu
-updateBalance();
-cardScanned = true;
-
-displayMessage("Welcome!", accountHolder, "Card: " + rfidUID.substring(0, 8), "", 2000);
-showMainMenu();
-
-// Halt PICC
-mfrc522.PICC_HaltA();
-mfrc522.PCD_StopCrypto1();
-}
-
-// ============ INITIALIZE LCD ============
-                           void initializeLCD() {
-    lcd.init();
-lcd.backlight();
-lcd.clear();
-}
-
-// ============ CONNECT TO WiFi ============
-                           void connectToWiFi() {
-    displayMessage("Connecting to", ssid, "", "", 1000);
-
-WiFi.begin(ssid, password);
-int attempts = 0;
-
-while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-delay(500);
-Serial.print(".");
-attempts++;
-}
-
-if (WiFi.status() == WL_CONNECTED) {
-Serial.println("\nWiFi Connected!");
-displayMessage("WiFi Connected", WiFi.localIP().toString(), "", "", 2000);
-} else {
-Serial.println("WiFi Failed!");
-displayMessage("WiFi Failed", "Check settings", "", "", 3000);
-}
-}
-
-// ============ INITIALIZE RFID ============
-                           void initializeRFID() {
-SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
-mfrc522.PCD_Init();
-Serial.println("RFID Reader initialized");
-}
-
-// ============ SHOW MAIN MENU ============
-                          void showMainMenu() {
-lcd.clear();
-lcd.setCursor(0, 0);
-lcd.print("Menu:");
-lcd.setCursor(0, 1);
-lcd.print("1:Balance 2:Withdraw");
-lcd.setCursor(0, 2);
-lcd.print("3:History");
-lcd.setCursor(0, 3);
-lcd.print("Scan new card to exit");
-}
-
-// ============ CHECK BALANCE ============
-                      void checkBalance() {
-displayMessage("Fetching balance...", "", "", "", 1000);
-
-updateBalance();
-
-lcd.clear();
-lcd.setCursor(0, 0);
-lcd.print(accountHolder);
-lcd.setCursor(0, 1);
-lcd.print("Account: " + currentAccount);
-lcd.setCursor(0, 2);
-lcd.print("Balance: $" + String(currentBalance, 2));
-lcd.setCursor(0, 3);
-lcd.print("Press any key...");
-
-// Wait for any key press
-while (!keypad.getKey()) {
-delay(100);
-}
-
-showMainMenu();
-}
-
-// ============ PERFORM WITHDRAWAL ============
-                        void performWithdrawal() {
-lcd.clear();
-lcd.setCursor(0, 0);
-lcd.print("Enter amount:");
-lcd.setCursor(0, 1);
-lcd.print("Use keypad");
-lcd.setCursor(0, 2);
-lcd.print("# confirm, * cancel");
-
-delay(1500);
-
-String amount = inputAmount();
-
-if (amount == "0" || amount == "") {
-displayMessage("Cancelled", "Returning...", "", "", 1500);
-showMainMenu();
-return;
-}
-
-float withdrawAmount = amount.toFloat();
-
-if (withdrawAmount > currentBalance) {
-displayMessage("Insufficient", "Balance!", "", "", 2000);
-}
-else if (withdrawAmount > 0) {
-currentBalance -= withdrawAmount;
-
-// Add transaction to history
-addTransaction("Withdrawal", withdrawAmount, "debit");
-
-lcd.clear();
-lcd.setCursor(0, 0);
-lcd.print("Withdrawal OK!");
-lcd.setCursor(0, 1);
-lcd.print("Amount: $" + String(withdrawAmount, 2));
-lcd.setCursor(0, 2);
-lcd.print("New Balance: $" + String(currentBalance, 2));
-lcd.setCursor(0, 3);
-lcd.print("Press any key...");
-
-while (!keypad.getKey()) {
-delay(100);
-}
-}
-
-showMainMenu();
-}
-
-// ============ VIEW HISTORY ============
-                     void viewHistory() {
-    displayMessage("Fetching history...", "", "", "", 1000);
-
-String response = makeAPICall("/api/transactions?account=" + currentAccount);
-
-if (response == "") {
-displayMessage("Error fetching", "history", "", "", 2000);
-showMainMenu();
-return;
-}
-
-// Parse JSON response
-StaticJsonDocument<2000> doc;
-deserializeJson(doc, response);
-
-JsonArray transactions = doc["transactions"];
-
-if (transactions.size() == 0) {
-displayMessage("No transactions", "found", "", "", 2000);
-showMainMenu();
-return;
-}
-
-// Display each transaction
-for (int i = 0; i < transactions.size(); i++) {
-JsonObject txn = transactions[i];
-
-lcd.clear();
-lcd.setCursor(0, 0);
-lcd.print("Transaction " + String(i + 1) + " of " + String(transactions.size()));
-lcd.setCursor(0, 1);
-lcd.print(txn["description"].as<String>());
-lcd.setCursor(0, 2);
-
-String type = txn["type"];
-if (type == "credit") {
-lcd.print("+ $" + String(txn["amount"].as<float>(), 2));
-} else {
-lcd.print("- $" + String(txn["amount"].as<float>(), 2));
-}
-
-lcd.setCursor(0, 3);
-lcd.print(txn["formattedTime"].as<String>());
-
-delay(3000);
-}
-
-// Show current timestamp
-String timeResponse = makeAPICall("/api/timestamp");
-StaticJsonDocument<200> timeDoc;
-deserializeJson(timeDoc, timeResponse);
-
-lcd.clear();
-lcd.setCursor(0, 0);
-lcd.print("Current Time:");
-lcd.setCursor(0, 1);
-lcd.print(timeDoc["formattedTime"].as<String>());
-lcd.setCursor(0, 2);
-lcd.print("Press any key...");
-
-while (!keypad.getKey()) {
-delay(100);
-}
-
-showMainMenu();
-}
-
-// ============ INPUT AMOUNT ============
-                      String inputAmount() {
-String amount = "";
-lcd.clear();
-lcd.setCursor(0, 0);
-lcd.print("Amount: $");
-lcd.setCursor(0, 1);
-lcd.print(amount);
-
-while (true) {
-char key = keypad.getKey();
-
-if (key >= '0' && key <= '9') {
-if (amount.length() < 10) {  // Limit to 10 digits
-amount += key;
-lcd.clear();
-lcd.setCursor(0, 0);
-lcd.print("Amount: $");
-lcd.setCursor(0, 1);
-lcd.print(amount);
-}
-}
-else if (key == '#') {
-// Confirm amount
-return amount;
-}
-else if (key == '*') {
-// Cancel
-return "0";
-}
-}
-}
-
-// ============ UPDATE BALANCE ============
-                       void updateBalance() {
-    String response = makeAPICall("/api/balance?account=" + currentAccount);
-
-if (response == "") {
-    currentBalance = 0.0;
-accountHolder = "Error";
-return;
-}
-
-StaticJsonDocument<200> doc;
-deserializeJson(doc, response);
-
-currentBalance = doc["balance"].as<float>();
-accountHolder = doc["accountHolder"].as<String>();
-}
-
-// ============ ADD TRANSACTION ============
-                    void addTransaction(String description, float amount, String type) {
-                                                                                       // This can be extended to send transaction data to the server
-Serial.println("Transaction: " + description + " - $" + String(amount, 2) + " (" + type + ")");
-}
-
-// ============ MAKE API CALL ============
-                         String makeAPICall(String endpoint) {
-if (WiFi.status() != WL_CONNECTED) {
-Serial.println("WiFi not connected");
-return "";
-}
-
-HTTPClient http;
-String url = "http://" + String(serverIP) + ":" + String(serverPort) + endpoint;
-
-Serial.println("Making request to: " + url);
-
-http.begin(url);
-int httpCode = http.GET();
-
-String response = "";
-
-if (httpCode > 0) {
-response = http.getString();
-Serial.println("Response: " + response);
-} else {
-Serial.println("HTTP Error: " + String(httpCode));
-}
-
-http.end();
-return response;
-}
-
-// ============ DISPLAY MESSAGE ============
-                        void displayMessage(String line1, String line2, String line3, String line4, int delayTime) {
-lcd.clear();
-
-if (line1 != "") {
-lcd.setCursor(0, 0);
-lcd.print(line1);
-}
-
-if (line2 != "") {
-lcd.setCursor(0, 1);
-lcd.print(line2);
-}
-
-if (line3 != "") {
-lcd.setCursor(0, 2);
-lcd.print(line3);
-}
-
-if (line4 != "") {
-lcd.setCursor(0, 3);
-lcd.print(line4);
-}
-
-delay(delayTime);
-}
+            </pre>
+          </div>
+        </div>
+        
+        <div class="info-box">
+          <h2>👥 Test Accounts</h2>
+          <div class="accounts-list">
+            <div class="account-item">
+              <strong>John Doe</strong><br>
+              Account: ACC001<br>
+              Card UID: 1234ABCD<br>
+              PIN: 1234<br>
+              Balance: $5,000.50
+            </div>
+            <div class="account-item">
+              <strong>Jane Smith</strong><br>
+              Account: ACC002<br>
+              Card UID: 5678EFGH<br>
+              PIN: 5678<br>
+              Balance: $12,500.75
+            </div>
+          </div>
+        </div>
+        
+        <div class="info-box">
+          <h2>🔒 Security Features</h2>
+          <ul style="padding-left: 20px; line-height: 2;">
+            <li>PIN verification (4-digit)</li>
+            <li>3 failed attempts lock account</li>
+            <li>Card UID + PIN authentication</li>
+            <li>Login history tracking</li>
+            <li>Transaction logging with timestamps</li>
+          </ul>
+        </div>
+      </div>
+    </body>
+    </html>
+    """
+    return html
+
+if __name__ == '__main__':
+    print("Starting GraphQL Banking API Server...")
+    print("GraphQL Playground: http://localhost:5000/graphql")
+    print("Documentation: http://localhost:5000")
+    print("\nTest Accounts:")
+    print("  Card: 1234ABCD | PIN: 1234 | Account: ACC001")
+    print("  Card: 5678EFGH | PIN: 5678 | Account: ACC002")
+    print("\nServer running on http://localhost:5000")
+    app.run(host='0.0.0.0', port=5000, debug=True)
