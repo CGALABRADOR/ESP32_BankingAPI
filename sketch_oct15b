@@ -1,0 +1,822 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// WiFi credentials
+const char* ssid = "MAPUA Wi-Fi";
+const char* password = "";
+
+// API Server - CHANGE THIS TO YOUR COMPUTER'S IP!
+const char* serverURL = "http://10.1.11.130:5000/graphql";
+
+// RFID setup
+#define SS_PIN 5
+#define RST_PIN 4
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// LCD setup
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Keypad setup
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {32, 33, 25, 26};
+byte colPins[COLS] = {27, 14, 12, 13};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// Buzzer setup
+#define BUZZER_PIN 15
+
+// Security constants
+const int MAX_PIN_LENGTH = 4;
+const int MAX_PIN_ATTEMPTS = 3;
+const unsigned long TIMEOUT = 30000;
+const unsigned long BALANCE_DISPLAY_TIME = 10000;
+const unsigned long API_TIMEOUT = 10000;
+
+// State machine
+enum State {
+  CONNECTING_WIFI,
+  WAITING_FOR_CARD,
+  ENTERING_PIN,
+  AUTHENTICATING,
+  SHOW_BALANCE,
+  SHOW_MENU,
+  WITHDRAW_AMOUNT,
+  PROCESSING_WITHDRAWAL,
+  ACCESS_DENIED,
+  CARD_BLOCKED
+};
+
+State currentState = CONNECTING_WIFI;
+String scannedUID = "";
+String enteredPIN = "";
+String accountId = "";
+String accountHolder = "";
+float accountBalance = 0.0;
+String withdrawAmount = "";
+int pinAttempts = 0;
+
+unsigned long stateStartTime = 0;
+unsigned long lastActivityTime = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\n========================================");
+  Serial.println("ESP32 ATM System Starting...");
+  Serial.println("========================================\n");
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+  
+  // Initialize SPI and RFID
+  SPI.begin();
+  rfid.PCD_Init();
+  Serial.println("[OK] RFID initialized");
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  Serial.println("[OK] Buzzer initialized");
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  delay(2000);
+  currentState = WAITING_FOR_CARD;
+  updateDisplay();
+  Serial.println("\n[READY] System ready. Waiting for card...\n");
+}
+
+void loop() {
+  switch (currentState) {
+    case WAITING_FOR_CARD:
+      handleCardScan();
+      break;
+    
+    case ENTERING_PIN:
+      handlePinEntry();
+      checkTimeout();
+      break;
+    
+    case AUTHENTICATING:
+      authenticateWithAPI();
+      break;
+    
+    case SHOW_BALANCE:
+      displayBalance();
+      break;
+    
+    case SHOW_MENU:
+      handleMenu();
+      break;
+    
+    case WITHDRAW_AMOUNT:
+      handleWithdrawInput();
+      checkTimeout();
+      break;
+    
+    case PROCESSING_WITHDRAWAL:
+      processWithdrawal();
+      break;
+    
+    case ACCESS_DENIED:
+      delay(3000);
+      resetToStart();
+      break;
+    
+    case CARD_BLOCKED:
+      delay(5000);
+      resetToStart();
+      break;
+  }
+}
+
+void connectToWiFi() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  
+  Serial.println("Connecting to WiFi...");
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    lcd.setCursor(attempts % 16, 1);
+    lcd.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n\n[SUCCESS] WiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Server URL: ");
+    Serial.println(serverURL);
+    Serial.println();
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Connected!");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP());
+    buzz(200);
+    delay(2000);
+  } else {
+    Serial.println("\n\n[FAIL] WiFi Connection Failed!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Failed!");
+    lcd.setCursor(0, 1);
+    lcd.print("Check settings");
+    while(1) { 
+      buzz(100);
+      delay(1000); 
+    }
+  }
+}
+
+void handleCardScan() {
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    scannedUID = "";
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      if (rfid.uid.uidByte[i] < 0x10) scannedUID += "0";
+      scannedUID += String(rfid.uid.uidByte[i], HEX);
+    }
+    scannedUID.toUpperCase();
+    
+    Serial.println("\n>>> CARD SCANNED <<<");
+    Serial.print("Card UID: ");
+    Serial.println(scannedUID);
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Card Detected");
+    lcd.setCursor(0, 1);
+    lcd.print(scannedUID.substring(0, 16));
+    
+    buzz(200);
+    delay(1500);
+    
+    enteredPIN = "";
+    pinAttempts = 0;
+    currentState = ENTERING_PIN;
+    stateStartTime = millis();
+    lastActivityTime = millis();
+    updateDisplay();
+    
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+  }
+}
+
+void handlePinEntry() {
+  char key = keypad.getKey();
+  
+  if (key) {
+    buzz(50);
+    lastActivityTime = millis();
+    
+    if (key == '#') {
+      if (enteredPIN.length() == MAX_PIN_LENGTH) {
+        Serial.println("\n>>> PIN SUBMITTED <<<");
+        Serial.print("PIN: ");
+        Serial.println(enteredPIN);
+        currentState = AUTHENTICATING;
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Authenticating..");
+      } else {
+        lcd.setCursor(0, 1);
+        lcd.print("4 digits needed!");
+        buzz(100);
+        delay(1000);
+        updateDisplay();
+      }
+    } 
+    else if (key == '*') {
+      enteredPIN = "";
+      updateDisplay();
+    } 
+    else if (key == 'D') {
+      Serial.println(">>> CANCELLED BY USER <<<");
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Cancelled");
+      delay(1500);
+      resetToStart();
+    }
+    else if (enteredPIN.length() < MAX_PIN_LENGTH && key >= '0' && key <= '9') {
+      enteredPIN += key;
+      updateDisplay();
+    }
+  }
+}
+
+void authenticateWithAPI() {
+  Serial.println("\n========== AUTHENTICATION REQUEST ==========");
+  
+  // Check WiFi first
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[ERROR] WiFi not connected!");
+    Serial.print("WiFi Status Code: ");
+    Serial.println(WiFi.status());
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Error!");
+    lcd.setCursor(0, 1);
+    lcd.print("Reconnecting...");
+    buzz(100);
+    
+    WiFi.reconnect();
+    delay(3000);
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[ERROR] Reconnection failed!");
+      resetToStart();
+      return;
+    }
+    Serial.println("[OK] Reconnected successfully!");
+  }
+  
+  Serial.print("Card UID: ");
+  Serial.println(scannedUID);
+  Serial.print("PIN: ");
+  Serial.println(enteredPIN);
+  Serial.print("Server URL: ");
+  Serial.println(serverURL);
+  Serial.print("WiFi IP: ");
+  Serial.println(WiFi.localIP());
+  
+  HTTPClient http;
+  http.begin(serverURL);
+  http.setTimeout(API_TIMEOUT);
+  http.addHeader("Content-Type", "application/json");
+  
+  // Build GraphQL query
+  String query = "{\"query\":\"{ authenticate(cardUid: \\\"" + scannedUID + 
+                 "\\\", pin: \\\"" + enteredPIN + "\\\") { success message account { accountId accountHolder balance } } }\"}";
+  
+  Serial.println("\nSending GraphQL Query:");
+  Serial.println(query);
+  Serial.println("\nWaiting for response...");
+  
+  int httpCode = http.POST(query);
+  
+  Serial.print("\nHTTP Response Code: ");
+  Serial.println(httpCode);
+  
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println("\n--- SERVER RESPONSE ---");
+    Serial.println(response);
+    Serial.println("--- END RESPONSE ---\n");
+    
+    // Parse JSON response
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, response);
+    
+    if (error) {
+      Serial.print("[ERROR] JSON Parse Failed: ");
+      Serial.println(error.c_str());
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Parse Error!");
+      lcd.setCursor(0, 1);
+      lcd.print(error.c_str());
+      buzz(100);
+      delay(3000);
+      resetToStart();
+      http.end();
+      return;
+    }
+    
+    // Check if data exists
+    if (!doc.containsKey("data")) {
+      Serial.println("[ERROR] Response missing 'data' field!");
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Server Error!");
+      lcd.setCursor(0, 1);
+      lcd.print("Invalid response");
+      buzz(100);
+      delay(3000);
+      resetToStart();
+      http.end();
+      return;
+    }
+    
+    bool success = doc["data"]["authenticate"]["success"];
+    String message = doc["data"]["authenticate"]["message"].as<String>();
+    
+    Serial.print("Success: ");
+    Serial.println(success ? "YES" : "NO");
+    Serial.print("Message: ");
+    Serial.println(message);
+    
+    if (success) {
+      accountId = doc["data"]["authenticate"]["account"]["accountId"].as<String>();
+      accountHolder = doc["data"]["authenticate"]["account"]["accountHolder"].as<String>();
+      accountBalance = doc["data"]["authenticate"]["account"]["balance"];
+      
+      Serial.println("\n[SUCCESS] Authentication successful!");
+      Serial.print("Account ID: ");
+      Serial.println(accountId);
+      Serial.print("Account Holder: ");
+      Serial.println(accountHolder);
+      Serial.print("Balance: $");
+      Serial.println(accountBalance, 2);
+      Serial.println("==========================================\n");
+      
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Welcome!");
+      lcd.setCursor(0, 1);
+      if (accountHolder.length() > 16) {
+        lcd.print(accountHolder.substring(0, 16));
+      } else {
+        lcd.print(accountHolder);
+      }
+      
+      buzz(300);
+      delay(100);
+      buzz(300);
+      
+      delay(2000);
+      currentState = SHOW_BALANCE;
+      stateStartTime = millis();
+    } else {
+      pinAttempts++;
+      
+      Serial.print("[FAIL] Authentication failed! Attempt ");
+      Serial.print(pinAttempts);
+      Serial.print(" of ");
+      Serial.println(MAX_PIN_ATTEMPTS);
+      Serial.println("==========================================\n");
+      
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      
+      if (pinAttempts >= MAX_PIN_ATTEMPTS) {
+        lcd.print("CARD BLOCKED!");
+        lcd.setCursor(0, 1);
+        lcd.print("Contact support");
+        
+        for (int i = 0; i < 3; i++) {
+          buzz(100);
+          delay(150);
+        }
+        
+        currentState = CARD_BLOCKED;
+      } else {
+        lcd.print("ACCESS DENIED");
+        lcd.setCursor(0, 1);
+        lcd.print("Attempt " + String(pinAttempts) + "/" + String(MAX_PIN_ATTEMPTS));
+        
+        buzz(100);
+        delay(150);
+        buzz(100);
+        
+        delay(2000);
+        
+        enteredPIN = "";
+        currentState = ENTERING_PIN;
+        stateStartTime = millis();
+        updateDisplay();
+      }
+    }
+  } else {
+    Serial.println("\n========== HTTP ERROR ==========");
+    Serial.print("Error Code: ");
+    Serial.println(httpCode);
+    
+    String errorMsg = "";
+    switch(httpCode) {
+      case -1:
+        errorMsg = "Connection fail";
+        Serial.println("\n[DIAGNOSIS]");
+        Serial.println("Cannot connect to server!");
+        Serial.println("Check:");
+        Serial.println("  1. Is Python server running?");
+        Serial.println("  2. Is IP address correct?");
+        Serial.println("  3. Are both on same WiFi network?");
+        Serial.println("  4. Is firewall blocking port 5000?");
+        break;
+      case -2:
+      case -3:
+        errorMsg = "Connection lost";
+        Serial.println("Connection lost during transfer");
+        break;
+      case -4:
+      case -11:
+        errorMsg = "Timeout";
+        Serial.println("Server timeout - server may be slow or down");
+        break;
+      case 400:
+        errorMsg = "Bad request";
+        Serial.println("GraphQL query format error");
+        break;
+      case 404:
+        errorMsg = "Not found";
+        Serial.println("Check server URL - should end with /graphql");
+        break;
+      case 500:
+        errorMsg = "Server crash";
+        Serial.println("Server error - check Python console for errors");
+        break;
+      default:
+        errorMsg = "Error " + String(httpCode);
+        Serial.println("Unknown HTTP error");
+    }
+    Serial.println("================================\n");
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Server Error!");
+    lcd.setCursor(0, 1);
+    lcd.print(errorMsg);
+    buzz(100);
+    delay(4000);
+    resetToStart();
+  }
+  
+  http.end();
+}
+
+void displayBalance() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Balance: $");
+  
+  if (accountBalance >= 1000000) {
+    lcd.print(accountBalance / 1000, 1);
+    lcd.print("K");
+  } else {
+    lcd.print(accountBalance, 2);
+  }
+  
+  lcd.setCursor(0, 1);
+  lcd.print("Press A for menu");
+  
+  char key = keypad.getKey();
+  if (key == 'A') {
+    buzz(50);
+    currentState = SHOW_MENU;
+    stateStartTime = millis();
+    updateDisplay();
+  } else if (key == 'D' || key == 'B') {
+    buzz(50);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Thank you!");
+    delay(2000);
+    resetToStart();
+  }
+  
+  if (millis() - stateStartTime > BALANCE_DISPLAY_TIME) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Session Timeout");
+    buzz(100);
+    delay(1500);
+    resetToStart();
+  }
+}
+
+void handleMenu() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("A:Withdraw");
+  lcd.setCursor(0, 1);
+  lcd.print("B:Balance  D:End");
+  
+  char key = keypad.getKey();
+  if (key) {
+    buzz(50);
+    if (key == 'A') {
+      withdrawAmount = "";
+      currentState = WITHDRAW_AMOUNT;
+      stateStartTime = millis();
+      lastActivityTime = millis();
+      updateDisplay();
+    } else if (key == 'B') {
+      currentState = SHOW_BALANCE;
+      stateStartTime = millis();
+      displayBalance();
+    } else if (key == 'D') {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Thank you!");
+      delay(2000);
+      resetToStart();
+    }
+  }
+  
+  checkTimeout();
+}
+
+void handleWithdrawInput() {
+  char key = keypad.getKey();
+  
+  if (key) {
+    buzz(50);
+    lastActivityTime = millis();
+    
+    if (key == '#') {
+      if (withdrawAmount.length() > 0) {
+        float amount = withdrawAmount.toFloat();
+        if (amount > 0 && amount <= accountBalance) {
+          currentState = PROCESSING_WITHDRAWAL;
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Processing...");
+        } else if (amount > accountBalance) {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Insufficient");
+          lcd.setCursor(0, 1);
+          lcd.print("Balance!");
+          buzz(100);
+          delay(2000);
+          withdrawAmount = "";
+          updateDisplay();
+        } else {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Invalid Amount!");
+          buzz(100);
+          delay(1500);
+          updateDisplay();
+        }
+      }
+    } 
+    else if (key == '*') {
+      withdrawAmount = "";
+      updateDisplay();
+    }
+    else if (key == 'D') {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Cancelled");
+      delay(1500);
+      currentState = SHOW_MENU;
+      updateDisplay();
+    }
+    else if (key >= '0' && key <= '9' && withdrawAmount.length() < 8) {
+      withdrawAmount += key;
+      updateDisplay();
+    }
+  }
+}
+
+void processWithdrawal() {
+  Serial.println("\n========== WITHDRAWAL REQUEST ==========");
+  Serial.print("Account ID: ");
+  Serial.println(accountId);
+  Serial.print("Amount: $");
+  Serial.println(withdrawAmount);
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[ERROR] WiFi not connected!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Error!");
+    buzz(100);
+    delay(2000);
+    resetToStart();
+    return;
+  }
+  
+  HTTPClient http;
+  http.begin(serverURL);
+  http.setTimeout(API_TIMEOUT);
+  http.addHeader("Content-Type", "application/json");
+  
+  String query = "{\"query\":\"mutation { withdrawMoney(accountId: \\\"" + accountId + 
+                 "\\\", amount: " + withdrawAmount + ") { success message newBalance } }\"}";
+  
+  Serial.println("Sending mutation:");
+  Serial.println(query);
+  
+  int httpCode = http.POST(query);
+  
+  Serial.print("HTTP Response Code: ");
+  Serial.println(httpCode);
+  
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println("Response:");
+    Serial.println(response);
+    Serial.println("==========================================\n");
+    
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, response);
+    
+    if (error) {
+      Serial.print("[ERROR] JSON Parse: ");
+      Serial.println(error.c_str());
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Parse Error!");
+      buzz(100);
+      delay(2000);
+      resetToStart();
+      http.end();
+      return;
+    }
+    
+    bool success = doc["data"]["withdrawMoney"]["success"];
+    String message = doc["data"]["withdrawMoney"]["message"].as<String>();
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    if (success) {
+      float newBalance = doc["data"]["withdrawMoney"]["newBalance"];
+      Serial.println("[SUCCESS] Withdrawal successful!");
+      Serial.print("New Balance: $");
+      Serial.println(newBalance, 2);
+      
+      lcd.print("Success!");
+      lcd.setCursor(0, 1);
+      lcd.print("Withdrew: $");
+      lcd.print(withdrawAmount);
+      buzz(300);
+      delay(2000);
+      
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("New Balance:");
+      lcd.setCursor(0, 1);
+      lcd.print("$");
+      lcd.print(newBalance, 2);
+      
+      accountBalance = newBalance;
+      delay(3000);
+    } else {
+      Serial.println("[FAIL] Withdrawal failed!");
+      Serial.print("Reason: ");
+      Serial.println(message);
+      
+      lcd.print("Failed!");
+      lcd.setCursor(0, 1);
+      if (message.length() > 16) {
+        lcd.print(message.substring(0, 16));
+      } else {
+        lcd.print(message);
+      }
+      buzz(100);
+      delay(100);
+      buzz(100);
+      delay(3000);
+    }
+    
+    resetToStart();
+  } else {
+    Serial.println("[ERROR] HTTP request failed!");
+    Serial.print("Error Code: ");
+    Serial.println(httpCode);
+    Serial.println("==========================================\n");
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Server Error!");
+    lcd.setCursor(0, 1);
+    lcd.print("Code: " + String(httpCode));
+    buzz(100);
+    delay(3000);
+    resetToStart();
+  }
+  
+  http.end();
+}
+
+void updateDisplay() {
+  lcd.clear();
+  
+  switch (currentState) {
+    case WAITING_FOR_CARD:
+      lcd.setCursor(0, 0);
+      lcd.print("Scan RFID Card");
+      lcd.setCursor(0, 1);
+      lcd.print("to begin");
+      break;
+    
+    case ENTERING_PIN:
+      lcd.setCursor(0, 0);
+      lcd.print("Enter PIN:");
+      lcd.setCursor(0, 1);
+      for (int i = 0; i < enteredPIN.length(); i++) {
+        lcd.print("*");
+      }
+      if (enteredPIN.length() == 0) {
+        lcd.print(" #:OK D:Cancel");
+      }
+      break;
+    
+    case SHOW_MENU:
+      lcd.setCursor(0, 0);
+      lcd.print("A:Withdraw");
+      lcd.setCursor(0, 1);
+      lcd.print("B:Balance  D:End");
+      break;
+    
+    case WITHDRAW_AMOUNT:
+      lcd.setCursor(0, 0);
+      lcd.print("Amount: $");
+      lcd.print(withdrawAmount);
+      lcd.setCursor(0, 1);
+      lcd.print("#:OK *:CLR D:Can");
+      break;
+  }
+}
+
+void checkTimeout() {
+  if (millis() - stateStartTime > TIMEOUT) {
+    Serial.println("\n[TIMEOUT] Session expired!\n");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Session Timeout");
+    buzz(100);
+    delay(100);
+    buzz(100);
+    delay(2000);
+    resetToStart();
+  }
+}
+
+void resetToStart() {
+  Serial.println("\n[RESET] Returning to start screen...\n");
+  scannedUID = "";
+  enteredPIN = "";
+  accountId = "";
+  accountHolder = "";
+  accountBalance = 0.0;
+  withdrawAmount = "";
+  pinAttempts = 0;
+  currentState = WAITING_FOR_CARD;
+  updateDisplay();
+}
+
+void buzz(unsigned long duration) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(duration);
+  digitalWrite(BUZZER_PIN, LOW);
+}
